@@ -67,20 +67,19 @@ jobs:
           sudo ldconfig
           ldconfig -p | grep libwebp
 
-      - name: 恢复 sr-vulkan aarch64 轮子缓存
+      - name: 恢复 sr-vulkan 编译产物缓存（轻量：只缓存包目录 + 已编译的 .so）
         id: sr-cache
         uses: actions/cache@v4
         with:
-          path: sr-wheel-dist
-          key: sr-vulkan-wheel-${{ env.SR_VERSION }}-aarch64-v1
+          path: sr-pkg-src
+          key: sr-vulkan-pkgsrc-${{ env.SR_VERSION }}-aarch64-v1
 
-      - name: 编译 sr-vulkan aarch64 轮子（缓存未命中时）
+      - name: 编译 sr-vulkan aarch64 扩展（缓存未命中时）
         if: steps.sr-cache.outputs.cache-hit != 'true'
         run: |
           git clone --depth 1 --recurse-submodules --shallow-submodules \
             https://github.com/tonquer/sr-vulkan.git sr-vulkan-src
           cd sr-vulkan-src
-          pip install wheel
           # 补丁：aarch64 上链接作者预置的 libvulkan.aarch64.so（x86_64 构建用 libvulkan.so）
           python3 - <<'PY'
           s = open('setup.py').read()
@@ -95,10 +94,39 @@ jobs:
           # 4 核并行编译 ncnn + 四个超分工具
           export CMAKE_BUILD_PARALLEL_LEVEL=4
           python3 setup.py build
-          # 打 aarch64 轮子；优先 abi3 标签（与官方 x86_64 轮子一致），失败则退化为 cp310
+          # 关键步骤：setup.py build 把 sr_vulkan.so 编译到 build/lib.<平台>/sr_vulkan/ 下，
+          # 而 setup2.py 打包只收集源码目录 sr_vulkan/ 里的文件（MANIFEST.in 的
+          # recursive-include sr_vulkan *.so）——必须把 .so 复制回源码包目录，否则
+          # 打出来的轮子里没有扩展模块（会变成 py3-none 的空壳轮子）
+          SO_FILE=$(find build -name 'sr_vulkan.so' -not -path '*/temp.*' | head -n1)
+          echo "编译产物: ${SO_FILE}"
+          test -n "${SO_FILE}" || { echo "::error::未找到 sr_vulkan.so"; exit 1; }
+          cp "${SO_FILE}" sr_vulkan/
+          ls -la sr_vulkan/
+          cd ..
+          # 组装轻量打包源（只留打 wheel 需要的文件，供缓存与后续打包使用）
+          mkdir -p sr-pkg-src
+          cp -r sr-vulkan-src/sr_vulkan sr-pkg-src/
+          cp sr-vulkan-src/setup2.py sr-vulkan-src/MANIFEST.in sr-vulkan-src/LICENSE sr-pkg-src/
+
+      - name: 打包 sr-vulkan aarch64 轮子
+        run: |
+          cd sr-pkg-src
+          test -f sr_vulkan/sr_vulkan.so || { echo "::error::sr_vulkan.so 缺失（缓存或编译有问题）"; exit 1; }
+          pip install wheel
+          # 优先 abi3 标签（与官方 x86_64 轮子一致），失败则退化为 cp310
           python3 setup2.py bdist_wheel --plat-name=manylinux_2_31_aarch64 --py-limited-api=cp37 \
             || python3 setup2.py bdist_wheel --plat-name=manylinux_2_31_aarch64
           ls -la dist/
+          # 自检：轮子里必须包含 sr_vulkan.so
+          python3 - <<'PY'
+          import zipfile, glob
+          whl = glob.glob('dist/*.whl')
+          assert whl, 'no wheel built'
+          names = zipfile.ZipFile(whl[0]).namelist()
+          assert any(n.endswith('sr_vulkan/sr_vulkan.so') for n in names), 'wheel 缺少 sr_vulkan.so: ' + str(names)
+          print('✅ 轮子内容自检通过:', whl[0], len(names), '个文件')
+          PY
           mkdir -p ../sr-wheel-dist
           cp dist/*.whl ../sr-wheel-dist/
 
