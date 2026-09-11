@@ -83,9 +83,16 @@ jobs:
         run: |
           python script/build_qrc.py
           cd src
-          pyinstaller --hidden-import=_cffi_backend --collect-data curl_cffi -w start.py
+          # --collect-all shiboken6：显式收集 libshiboken6.abi3.so.6.5（PySide6 绑定库的相互依赖）
+          pyinstaller --hidden-import=_cffi_backend --collect-data curl_cffi \
+            --collect-all shiboken6 -w start.py
           cd dist
-          # 检查主程序和所有内置 .so 的系统动态库依赖是否齐全
+          # 断言 shiboken6 确实被打进包（通常平铺在 _internal 根目录）
+          find start/_internal -name 'libshiboken6*' | grep -q . \
+            || { echo "::error::libshiboken6 未被收集进包"; exit 1; }
+          find start/_internal -name 'libshiboken6*' | head -3
+          # 按 PyInstaller 运行时环境检查：引导程序运行时会把 _internal 加进 LD_LIBRARY_PATH
+          export LD_LIBRARY_PATH="$(pwd)/start/_internal:${LD_LIBRARY_PATH}"
           CHECK() { { ldd start/start; find start/_internal -name '*.so*' -exec ldd {} + ; } 2>/dev/null; }
           CHECK > /tmp/ldd.log
           if grep -q "not found" /tmp/ldd.log; then
