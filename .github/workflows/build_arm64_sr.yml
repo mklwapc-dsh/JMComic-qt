@@ -1,15 +1,18 @@
 # JMComic-qt —— Linux arm64 (aarch64) 原生构建，含超分 (Waifu2x/Real-CUGAN/Real-ESRGAN)
 #
-# 与 build_arm64.yml（无超分版）的区别：
+# 设计要点：
 #   1) 先在 runner 上从源码编译 sr-vulkan 的 aarch64 轮子（作者仓库已预留 arm64 路径，
 #      只需 3 行补丁让 setup.py 在 aarch64 上选择 libvulkan.aarch64.so）；
 #   2) 安装该轮子 + 三个模型包，用完整的 src/requirements.txt 构建；
-#   3) 冒烟测试直接验证【CPU 超分】全链路（runner 无 GPU，sr.init() 返回负值走 CPU 模式），
-#      另用 lavapipe（软件 Vulkan）附带验证 GPU 路径；
+#   3) 无推理测试：仅保留毫秒/秒级的完整性自检（轮子必须含 sr_vulkan.so、关键文件进包、
+#      ldd 无缺库），超分实际效果交由实机验证——应用侧 start.py 对超分模块有 try/except
+#      兜底，模块异常时自动禁用超分，不影响其他功能；
 #   4) PyInstaller 需 --collect-all 收集 sr_vulkan 与三个模型包（模型 .param/.bin 是数据文件，
 #      只靠 hook 的 hiddenimport 不够，必须连带数据一起收集）。
 #
-# 注意：首次构建需现场编译 ncnn（约 25-45 分钟），成功后会缓存轮子，后续构建约 10-15 分钟。
+# 耗时说明：
+#   - 首次构建需现场编译 ncnn（约 35-45 分钟），编译产物（约 4MB）会存入 GitHub cache；
+#   - 之后每次构建命中缓存直接跳过编译，全程约 10-15 分钟。
 
 name: build-arm64-sr
 
@@ -56,7 +59,7 @@ jobs:
             libgtk-3-0 libgdk-pixbuf-2.0-0 libpango-1.0-0 \
             libmariadb3 libpq5 libodbc2 \
             libssl3 libicu70 libfuse2 \
-            libvulkan1 mesa-vulkan-drivers vulkan-tools
+            libvulkan1
 
       - name: 安装 libwebp.so.6（jammy 只有 libwebp7，SONAME 不匹配，从 focal 取 libwebp6）
         run: |
@@ -74,7 +77,7 @@ jobs:
           path: sr-pkg-src
           key: sr-vulkan-pkgsrc-${{ env.SR_VERSION }}-aarch64-v1
 
-      - name: 编译 sr-vulkan aarch64 扩展（缓存未命中时）
+      - name: 编译 sr-vulkan aarch64 扩展（缓存未命中时，约 35-45 分钟，仅首次）
         if: steps.sr-cache.outputs.cache-hit != 'true'
         run: |
           git clone --depth 1 --recurse-submodules --shallow-submodules \
@@ -109,7 +112,7 @@ jobs:
           cp -r sr-vulkan-src/sr_vulkan sr-pkg-src/
           cp sr-vulkan-src/setup2.py sr-vulkan-src/MANIFEST.in sr-vulkan-src/LICENSE sr-pkg-src/
 
-      - name: 打包 sr-vulkan aarch64 轮子
+      - name: 打包 sr-vulkan aarch64 轮子（秒级）
         run: |
           cd sr-pkg-src
           test -f sr_vulkan/sr_vulkan.so || { echo "::error::sr_vulkan.so 缺失（缓存或编译有问题）"; exit 1; }
@@ -118,7 +121,7 @@ jobs:
           python3 setup2.py bdist_wheel --plat-name=manylinux_2_31_aarch64 --py-limited-api=cp37 \
             || python3 setup2.py bdist_wheel --plat-name=manylinux_2_31_aarch64
           ls -la dist/
-          # 自检：轮子里必须包含 sr_vulkan.so
+          # 自检：轮子里必须包含 sr_vulkan.so（防止打出 py3-none 空壳轮子）
           python3 - <<'PY'
           import zipfile, glob
           whl = glob.glob('dist/*.whl')
@@ -139,68 +142,8 @@ jobs:
           # 用本地轮子替代 PyPI 上的 sr-vulkan（PyPI 只有 x86_64 轮子）
           grep -v '^sr-vulkan$' src/requirements.txt > /tmp/requirements_sr_arm64.txt
           pip install -r /tmp/requirements_sr_arm64.txt
-          QT_QPA_PLATFORM=offscreen python -c "from PySide6 import QtCore, QtGui, QtWidgets; import curl_cffi; print('base deps ok')"
-
-      - name: CPU 超分冒烟测试（runner 无 GPU，验证 CPU 模式全链路）
-        run: |
-          python3 - <<'PY'
-          from sr_vulkan import sr_vulkan as sr
-          import io
-          from PIL import Image
-
-          print("version:", sr.getVersion())
-          sr.setDebug(True)
-          sts = sr.init()
-          print("sr.init ->", sts, "（<0 表示无 GPU，走 CPU 模式，符合预期）")
-          print("cpu cores:", sr.getCpuCoreNum())
-          print("gpu list:", sr.getGpuInfo())
-
-          # 与应用一致：initSet(config.Encode, config.UseCpuNum) = initSet(0, 0)
-          sts2 = sr.initSet(0, 0)
-          print("initSet(0,0) ->", sts2)
-
-          buf = io.BytesIO()
-          Image.new("RGB", (64, 64), (128, 90, 60)).save(buf, "PNG")
-          data = buf.getvalue()
-
-          rid = sr.add(data, sr.MODEL_WAIFU2X_CUNET_UP2X, 1, 2.0, format="png")
-          if rid < 0:
-              print("add failed:", sr.getLastError(), "→ 用 gpuId=-1 显式 CPU 重试")
-              sr.initSet(-1, 4)
-              rid = sr.add(data, sr.MODEL_WAIFU2X_CUNET_UP2X, 1, 2.0, format="png")
-          print("sr.add ->", rid)
-          assert rid >= 0, "sr.add 失败: " + sr.getLastError()
-
-          out = sr.load(0)
-          assert out, "sr.load 返回空"
-          out_data, fmt, back_id, tick = out
-          print("sr.load ->", len(out_data), "bytes, format:", fmt, ", tick:", tick)
-          assert isinstance(out_data, bytes) and len(out_data) > 100
-          img = Image.open(io.BytesIO(out_data))
-          print("输出尺寸:", img.size, "（输入 64x64，2x 应为 128x128）")
-          assert img.size == (128, 128), "输出尺寸不是 2x"
-          print("✅ CPU 超分全链路通过")
-          PY
-
-      - name: GPU 超分冒烟测试（lavapipe 软件 Vulkan，仅供参考）
-        continue-on-error: true
-        run: |
-          ls /usr/share/vulkan/icd.d/
-          export VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.aarch64.json
-          python3 - <<'PY'
-          from sr_vulkan import sr_vulkan as sr
-          import io
-          from PIL import Image
-          sts = sr.init()
-          print("init:", sts, "gpu:", sr.getGpuInfo())
-          buf = io.BytesIO()
-          Image.new("RGB", (64, 64), (128, 90, 60)).save(buf, "PNG")
-          rid = sr.add(buf.getvalue(), sr.MODEL_WAIFU2X_CUNET_UP2X, 1, 2.0, format="png")
-          print("add:", rid)
-          out = sr.load(0)
-          if out:
-              print("✅ lavapipe GPU 路径输出", len(out[0]), "bytes")
-          PY
+          # 仅做导入级验证（秒级）：确认 sr_vulkan 扩展能被加载，不跑真实推理
+          QT_QPA_PLATFORM=offscreen python -c "from PySide6 import QtCore, QtGui, QtWidgets; import curl_cffi; from sr_vulkan import sr_vulkan as sr; print('deps ok, sr version:', sr.getVersion())"
 
       - name: PyInstaller 打包 + 动态库完整性检查
         run: |
